@@ -129,8 +129,7 @@ class DiffusionForcingPipeline:
 
         # 4. Short video generation. TODO: not yet modified properly
         if overlap_history is None or base_num_frames is None or num_frames <= base_num_frames:
-            if prefix_video is not None:
-                latents[0][:, :predix_video_latent_length] = prefix_video[0].to(transformer_dtype)
+            latents = latents_full
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
             step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                 f, init_timesteps, base_num_frames, ar_step, predix_video_latent_length, causal_block_size
@@ -146,33 +145,27 @@ class DiffusionForcingPipeline:
                 valid_interval_i = valid_interval[i]
                 valid_interval_start, valid_interval_end = valid_interval_i
                 timestep = timestep_i[None, valid_interval_start:valid_interval_end].clone()
-                latent_model_input = [latents[0][:, valid_interval_start:valid_interval_end, :, :].clone()]
+                latent_model_input = latents[:, :, valid_interval_start:valid_interval_end, :, :].clone()
                 if addnoise_condition > 0 and valid_interval_start < predix_video_latent_length:
                     noise_factor = 0.001 * addnoise_condition
                     timestep_for_noised_condition = addnoise_condition
-                    latent_model_input[0][:, valid_interval_start:predix_video_latent_length] = (
-                        latent_model_input[0][:, valid_interval_start:predix_video_latent_length] * (1.0 - noise_factor)
-                        + torch.randn_like(latent_model_input[0][:, valid_interval_start:predix_video_latent_length])
+                    latent_model_input[:, :, valid_interval_start:predix_video_latent_length] = (
+                        latent_model_input[:, :, valid_interval_start:predix_video_latent_length] * (1.0 - noise_factor)
+                        + torch.randn_like(latent_model_input[:, :, valid_interval_start:predix_video_latent_length])
                         * noise_factor
                     )
                     timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                noise_pred = dit(torch.stack([latent_model_input[0]]), timestep)[0]
+                noise_pred = dit(latent_model_input, timestep / 1000.0)
                 for idx in range(valid_interval_start, valid_interval_end):
                     if update_mask_i[idx].item():
-                        latents[0][:, idx] = sample_schedulers[idx].step(
-                            noise_pred[:, idx - valid_interval_start],
+                        latents[:, :, idx] = sample_schedulers[idx].step(
+                            noise_pred[:, :, idx - valid_interval_start],
                             timestep_i[idx],
-                            latents[0][:, idx],
+                            latents[:, :, idx],
                             return_dict=False,
                         )[0]
                         sample_schedulers_counter[idx] += 1
-            x0 = latents[0].unsqueeze(0)
-            videos = vae.decode(x0)
-            videos = (videos / 2 + 0.5).clamp(0, 1)
-            videos = [video for video in videos]
-            videos = [video.permute(1, 2, 3, 0) * 255 for video in videos]
-            videos = [video.cpu().numpy().astype(np.uint8) for video in videos]
-            return videos
+            return latents_full
         # 4. Long video generation (sliding window)
         else:
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
@@ -195,8 +188,6 @@ class DiffusionForcingPipeline:
                 else:  # i == 0
                     base_num_frames_iter = base_num_frames
                     latents = latents_full[:, :, :base_num_frames_iter, :, :]
-                # if prefix_video is not None:
-                #     latents[:, :, :predix_video_latent_length] = prefix_video.to(transformer_dtype)
                 # 4.2 Decide the step of each frame in the sliding window
                 step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                     base_num_frames_iter,
@@ -232,7 +223,7 @@ class DiffusionForcingPipeline:
                             * noise_factor
                         )
                         timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                    noise_pred = dit(latent_model_input, timestep)
+                    noise_pred = dit(latent_model_input, timestep / 1000.0)
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
                             latents[:, :, idx] = sample_schedulers[idx].step(
