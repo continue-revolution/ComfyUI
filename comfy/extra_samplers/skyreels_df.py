@@ -3,11 +3,9 @@ import math
 from typing import List
 from tqdm import tqdm
 
-import numpy as np
 import torch
 
 from comfy.samplers import CFGGuider
-from comfy.sd import VAE
 
 from .uni_pc_diffusers import FlowUniPCMultistepScheduler # TODO: reduce code duplicate
 
@@ -122,7 +120,6 @@ class DiffusionForcingPipeline:
         num_frames = (f - 1) * 4 + 1
         prefix_video = None
         predix_video_latent_length = 0
-        transformer_dtype = dit.model_patcher.model_dtype()
         scheduler = FlowUniPCMultistepScheduler()
         scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
         init_timesteps = scheduler.timesteps
@@ -155,7 +152,7 @@ class DiffusionForcingPipeline:
                         * noise_factor
                     )
                     timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                noise_pred = dit(latent_model_input, timestep / 1000.0)
+                noise_pred = dit(latent_model_input, timestep * 0.001)
                 for idx in range(valid_interval_start, valid_interval_end):
                     if update_mask_i[idx].item():
                         latents[:, :, idx] = sample_schedulers[idx].step(
@@ -205,9 +202,9 @@ class DiffusionForcingPipeline:
                     sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
                     sample_schedulers.append(sample_scheduler)
                 # 4.4 Denoise the short video in the sliding window
-                for i, timestep_i in enumerate(tqdm(step_matrix)):
-                    update_mask_i = step_update_mask[i]
-                    valid_interval_i = valid_interval[i]
+                for j, timestep_i in enumerate(tqdm(step_matrix)):
+                    update_mask_i = step_update_mask[j]
+                    valid_interval_i = valid_interval[j]
                     valid_interval_start, valid_interval_end = valid_interval_i
                     timestep = timestep_i[None, valid_interval_start:valid_interval_end].clone()
                     latent_model_input = latents[:, :, valid_interval_start:valid_interval_end, :, :].clone()
@@ -218,12 +215,12 @@ class DiffusionForcingPipeline:
                             latent_model_input[:, :, valid_interval_start:predix_video_latent_length]
                             * (1.0 - noise_factor)
                             + torch.randn_like(
-                                latent_model_input[0][:, valid_interval_start:predix_video_latent_length]
+                                latent_model_input[:, :, valid_interval_start:predix_video_latent_length]
                             )
                             * noise_factor
                         )
                         timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                    noise_pred = dit(latent_model_input, timestep / 1000.0)
+                    noise_pred = dit(latent_model_input, timestep * 0.001)
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
                             latents[:, :, idx] = sample_schedulers[idx].step(

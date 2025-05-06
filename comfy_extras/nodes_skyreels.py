@@ -20,7 +20,7 @@ class SkyReelsDFSampler:
                 "latent_image": ("LATENT", {"tooltip": "The latent image to denoise."}),
                 # TODO: It could be tricky to explain these parameters to users. For now let's use default.
                 "overlap_history": ("INT", {"default": 17, "min": 0, "max": 50, "tooltip": "Number of frames to overlap for smooth transitions in long videos"}),
-                "addnoise_condition": ("INT", {"default": 20, "min": 0, "max": 100, "tooltip": "Improves consistency in long video generation"}),
+                "addnoise_condition": ("INT", {"default": 0, "min": 0, "max": 100, "tooltip": "Improves consistency in long video generation"}),
                 "base_num_frames": ("INT", {"default": 97, "min": 97, "max": 121, "tooltip": "Base frame count (**97 for 540P**, **121 for 720P**)"}),
                 "ar_step": ("INT", {"default": 5, "min": 0, "max": 10, "tooltip": "Controls asynchronous inference (0 for synchronous mode)"}),
                 "causal_block_size": ("INT", {"default": 5, "min": 1, "max": 10, "tooltip": "Recommended when using asynchronous inference (--ar_step > 0)"}),
