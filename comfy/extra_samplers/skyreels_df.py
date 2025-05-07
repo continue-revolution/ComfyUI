@@ -162,7 +162,7 @@ class DiffusionForcingPipeline:
                             return_dict=False,
                         )[0]
                         sample_schedulers_counter[idx] += 1
-            return latents_full
+            return [latents_full]
         # 4. Long video generation (sliding window)
         else:
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
@@ -170,6 +170,7 @@ class DiffusionForcingPipeline:
             n_iter = 1 + (f - base_num_frames - 1) // (base_num_frames - overlap_history_frames) + 1
             print(f"# of large sliding windows: {n_iter}")
             # 4.1 Large sliding window: each sliding window goes through DiT as a short video, but only a few contribute to latent updates.
+            latents_base = []
             for i in range(n_iter):
                 if i > 0:  # i !=0
                     prefix_video = latents[:, :, -overlap_history_frames:]
@@ -230,4 +231,5 @@ class DiffusionForcingPipeline:
                                 return_dict=False,
                             )[0]
                             sample_schedulers_counter[idx] += 1
-            return latents_full
+                latents_base.append(latents.clone())
+            return latents_base
