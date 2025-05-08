@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import torch
 
+from comfy import model_management
 from comfy.samplers import CFGGuider
 from comfy.sd import VAE
 
@@ -179,8 +180,8 @@ class DiffusionForcingPipeline:
             for i in range(n_iter):
                 if i > 0:  # i !=0
                     prefix_video = decoded_curr_output[:, :, -overlap_history:].to(device)
-                    prefix_video = dit.inner_model.process_latent_in(prefix_video)
                     prefix_video = vae.first_stage_model.encode(prefix_video)
+                    prefix_video = dit.inner_model.process_latent_in(prefix_video)
                     if prefix_video.shape[2] % causal_block_size != 0:
                         truncate_len = prefix_video.shape[2] % causal_block_size
                         print("the length of prefix video is truncated for the casual block size alignment.")
@@ -262,11 +263,13 @@ class DiffusionForcingPipeline:
                     if latents_diff.abs().max() > 0.1:
                         print(f"{i}.{j} latents diff is too large: {latents_diff.abs().max()}")
                 latents = dit.inner_model.process_latent_out(latents.to(torch.float32))
+                vae_memory_used = vae.memory_used_decode(latents.shape, vae.vae_dtype)
+                model_management.load_models_gpu([vae.patcher], memory_required=vae_memory_used, force_full_load=vae.disable_offload)
                 decoded_curr_output = vae.first_stage_model.decode(latents).float().clamp(-1, 1).cpu()
                 if i > 0:
                     decoded_output = torch.cat([decoded_output, decoded_curr_output[:, :, overlap_history:]], dim=2)
                 else:
                     decoded_output = decoded_curr_output
-            pixel_samples = vae.process_output(decoded_output).to(vae.output_device)
+            pixel_samples = vae.process_output(decoded_output).to(vae.output_device).movedim(1,-1)
             pixel_samples = pixel_samples.reshape(-1, *pixel_samples.shape[-3:])
             return pixel_samples

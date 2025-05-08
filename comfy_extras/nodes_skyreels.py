@@ -30,8 +30,8 @@ class SkyReelsDFSampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE")
-    OUTPUT_TOOLTIPS = ("The decoded image.", "Number of frames to overlap for smooth transitions in long videos. Connect this to overlap input at Node SkyReelsVAEDecode")
+    RETURN_TYPES = ("IMAGE", )
+    OUTPUT_TOOLTIPS = ("The decoded image.", )
     FUNCTION = "sample"
 
     CATEGORY = "sampling"
