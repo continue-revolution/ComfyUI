@@ -106,13 +106,8 @@ class SkyReelsVAEDecode:
     DESCRIPTION = "Decodes latent images back into pixel space images."
 
     def decode(self, vae, samples, overlap):
-        mean = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,]
-        std = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,]
-        mean = torch.tensor(mean, device=vae.device).view(1, vae.first_stage_model.z_dim, 1, 1, 1)
-        std = torch.tensor(std, device=vae.device).view(1, vae.first_stage_model.z_dim, 1, 1, 1)
         output_frames = None
         for sample in samples["samples"]:
-            sample = sample * std + mean
             output_frames = vae.decode(sample) if output_frames is None else torch.cat((output_frames, vae.decode(sample)[:, overlap:]), dim=1)
         if len(output_frames.shape) == 5: #Combine batches
             output_frames = output_frames.reshape(-1, output_frames.shape[-3], output_frames.shape[-2], output_frames.shape[-1])

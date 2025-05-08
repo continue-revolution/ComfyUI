@@ -154,7 +154,7 @@ class DiffusionForcingPipeline:
                             latents[:, :, idx],
                         )
                         sample_schedulers_counter[idx] += 1
-            return [latents_full]
+            return [dit.inner_model.process_latent_out(latents_full.to(torch.float32))]
         # 4. Long video generation (sliding window)
         else:
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
@@ -217,5 +217,5 @@ class DiffusionForcingPipeline:
                                 latents[:, :, idx],
                             )
                             sample_schedulers_counter[idx] += 1
-                latents_base.append(latents.clone())
+                latents_base.append(dit.inner_model.process_latent_out(latents.to(torch.float32)))
             return latents_base
