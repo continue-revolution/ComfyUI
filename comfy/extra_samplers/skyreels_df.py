@@ -173,7 +173,7 @@ class DiffusionForcingPipeline:
             # 4.1 Large sliding window: each sliding window goes through DiT as a short video, but only a few contribute to latent updates.
             for i in range(n_iter):
                 if i > 0:  # i !=0
-                    prefix_video = decoded_curr_output[:, :, -overlap_history:].to(device)
+                    prefix_video = decoded_curr_output[:, :, -overlap_history:].to(dtype=vae.vae_dtype, device=vae.device)
                     prefix_video = vae.first_stage_model.encode(prefix_video)
                     prefix_video = dit.inner_model.process_latent_in(prefix_video)
                     if prefix_video.shape[2] % causal_block_size != 0:
@@ -186,7 +186,7 @@ class DiffusionForcingPipeline:
                     base_num_frames_iter = min(left_frame_num + overlap_history_frames, base_num_frames)
                 else:  # i == 0
                     base_num_frames_iter = base_num_frames
-                latents = torch.randn((b, c, base_num_frames_iter, h, w), dtype=dtype, generator=generator, device=device)
+                latents = torch.randn((b, c, base_num_frames_iter, h, w), dtype=dtype, device=device, generator=generator)
                 if prefix_video is not None:
                     latents[:, :, :predix_video_latent_length] = prefix_video.to(dtype)
                 # 4.2 Decide the step of each frame in the sliding window
@@ -228,7 +228,7 @@ class DiffusionForcingPipeline:
                                 latents[:, :, idx],
                             )
                             sample_schedulers_counter[idx] += 1
-                latents = dit.inner_model.process_latent_out(latents.to(torch.float32))
+                latents = dit.inner_model.process_latent_out(latents.to(torch.float32)).to(dtype=vae.vae_dtype, device=vae.device)
                 vae_memory_used = vae.memory_used_decode(latents.shape, vae.vae_dtype)
                 model_management.load_models_gpu([vae.patcher], memory_required=vae_memory_used, force_full_load=vae.disable_offload)
                 decoded_curr_output = vae.first_stage_model.decode(latents).float().clamp(-1, 1).cpu()
