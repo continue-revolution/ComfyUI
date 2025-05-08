@@ -3,7 +3,7 @@ from types import MethodType
 import torch
 
 import comfy.sample
-from comfy.samplers import CFGGuider, process_conds
+from comfy.samplers import CFGGuider, process_conds, KSampler
 import comfy.sampler_helpers
 
 from comfy.extra_samplers.skyreels_df import DiffusionForcingPipeline
@@ -18,6 +18,8 @@ class SkyReelsDFSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "The random seed used for creating the noise."}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000, "tooltip": "The number of steps used in the denoising process."}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01, "tooltip": "The Classifier-Free Guidance scale balances creativity and adherence to the prompt. Higher values result in images more closely matching the prompt however too high values will negatively impact quality."}),
+                "sampler_name": (["euler"], {"default": "uni_pc", "tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."}),
+                "scheduler": (KSampler.SCHEDULERS, {"default": "simple", "tooltip": "The scheduler controls how noise is gradually removed to form the image."}),
                 "positive": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to include in the image."}),
                 "negative": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to exclude from the image."}),
                 "latent_image": ("LATENT", {"tooltip": "The latent image to denoise."}),
@@ -37,18 +39,21 @@ class SkyReelsDFSampler:
     CATEGORY = "sampling"
     DESCRIPTION = "Uses the provided model, positive and negative conditioning to denoise the latent image."
 
-    def sample(self, dit, vae, seed, steps, cfg, positive, negative, latent_image, overlap_history=17, addnoise_condition=20, base_num_frames=97, ar_step=5, causal_block_size=5):
+    def sample(self, dit, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, overlap_history=17, addnoise_condition=20, base_num_frames=97, ar_step=5, causal_block_size=5):
         # copied from comfy.nodes.common_sampler
         latent = latent_image
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(dit, latent_image)
+
+        # copied from comfy.sample.sample
+        device = dit.load_device
+        sampler = KSampler(dit, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=1.0, model_options=dit.model_options)
 
         # copied from comfy.samplers.sample
         cfg_guider = CFGGuider(dit)
         cfg_guider.set_conds(positive, negative)
         cfg_guider.set_cfg(cfg)
         cfg_guider.conds = {}
-        device = cfg_guider.model_patcher.load_device
         for k in cfg_guider.original_conds:
             cfg_guider.conds[k] = list(map(lambda a: a.copy(), cfg_guider.original_conds[k]))
         cfg_guider.inner_model, cfg_guider.conds, cfg_guider.loaded_models = comfy.sampler_helpers.prepare_sampling(cfg_guider.model_patcher, latent_image.shape, cfg_guider.conds, cfg_guider.model_options)
@@ -60,20 +65,18 @@ class SkyReelsDFSampler:
             def identity_calculate_denoised(self, sigma, model_output, model_input):
                 return model_output
             cfg_guider.inner_model.model_sampling.calculate_denoised = MethodType(identity_calculate_denoised, cfg_guider.inner_model.model_sampling)
-            cfg_guider.inner_model.diffusion_model.to(torch.bfloat16)
-            with torch.cuda.amp.autocast(dtype=cfg_guider.model_patcher.model_dtype()), torch.no_grad():
-                samples = DiffusionForcingPipeline()(
-                    dit=cfg_guider,
-                    vae=vae,
-                    num_inference_steps=steps,
-                    shape=latent_image.shape,
-                    seed=seed,
-                    overlap_history=overlap_history,
-                    addnoise_condition=addnoise_condition,
-                    base_num_frames=base_num_frames,
-                    ar_step=ar_step,
-                    causal_block_size=causal_block_size,
-                )
+            samples = DiffusionForcingPipeline()(
+                dit=cfg_guider,
+                vae=vae,
+                sampler=sampler,
+                shape=latent_image.shape,
+                seed=seed,
+                overlap_history=overlap_history,
+                addnoise_condition=addnoise_condition,
+                base_num_frames=base_num_frames,
+                ar_step=ar_step,
+                causal_block_size=causal_block_size,
+            )
             cfg_guider.inner_model.model_sampling.calculate_denoised = original_calculte_denoised
         finally:
             cfg_guider.model_patcher.cleanup()

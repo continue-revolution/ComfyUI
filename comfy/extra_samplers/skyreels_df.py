@@ -8,8 +8,10 @@ import torch
 from comfy import model_management
 from comfy.samplers import CFGGuider
 from comfy.sd import VAE
+from comfy.samplers import CFGGuider, KSampler
+from comfy.model_sampling import ModelSamplingDiscreteFlow
 
-from .uni_pc_diffusers import FlowUniPCMultistepScheduler # TODO: reduce code duplicate
+from .flow_match_euler_step import FlowMatchEulerSampler
 
 
 class DiffusionForcingPipeline:
@@ -108,10 +110,9 @@ class DiffusionForcingPipeline:
         self,
         dit: CFGGuider,
         vae: VAE,
+        sampler: KSampler,
         shape: tuple,
         seed: int,
-        num_inference_steps: int,
-        shift: float = 8.0,
         overlap_history: int = 17,
         addnoise_condition: int = 20,
         base_num_frames: int = 97,
@@ -122,13 +123,13 @@ class DiffusionForcingPipeline:
         device = dit.model_patcher.load_device
         dtype = dit.model_patcher.model_dtype()
         b, c, f, h, w = shape
-        generator = torch.Generator('cuda').manual_seed(seed)
+        generator = torch.Generator(device=device).manual_seed(seed)
         num_frames = (f - 1) * 4 + 1
         prefix_video = None
         predix_video_latent_length = 0
-        scheduler = FlowUniPCMultistepScheduler()
-        scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-        init_timesteps = scheduler.timesteps
+        model_sampling: ModelSamplingDiscreteFlow = dit.model_patcher.get_model_object("model_sampling")
+        init_timesteps = model_sampling.timestep(sampler.sigmas)[:-1]
+        sample_scheduler = FlowMatchEulerSampler(sampler.sigmas)
 
         # 4. Short video generation. TODO: not yet modified properly
         if overlap_history is None or base_num_frames is None or num_frames <= base_num_frames:
@@ -137,12 +138,7 @@ class DiffusionForcingPipeline:
             step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                 f, init_timesteps, base_num_frames, ar_step, predix_video_latent_length, causal_block_size
             )
-            sample_schedulers: List[FlowUniPCMultistepScheduler] = []
             sample_schedulers_counter = [0] * f
-            for _ in range(f):
-                sample_scheduler = FlowUniPCMultistepScheduler()
-                sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-                sample_schedulers.append(sample_scheduler)
             for i, timestep_i in enumerate(tqdm(step_matrix)):
                 update_mask_i = step_update_mask[i]
                 valid_interval_i = valid_interval[i]
@@ -158,15 +154,14 @@ class DiffusionForcingPipeline:
                         * noise_factor
                     )
                     timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                noise_pred = dit(latent_model_input, timestep * 0.001)
+                noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                 for idx in range(valid_interval_start, valid_interval_end):
                     if update_mask_i[idx].item():
-                        latents[:, :, idx] = sample_schedulers[idx].step(
+                        latents[:, :, idx] = sample_scheduler.step(
                             noise_pred[:, :, idx - valid_interval_start],
-                            timestep_i[idx],
+                            sample_schedulers_counter[idx],
                             latents[:, :, idx],
-                            return_dict=False,
-                        )[0]
+                        )
                         sample_schedulers_counter[idx] += 1
             return [latents]
         # 4. Long video generation (sliding window)
@@ -176,7 +171,6 @@ class DiffusionForcingPipeline:
             n_iter = 1 + (f - base_num_frames - 1) // (base_num_frames - overlap_history_frames) + 1
             print(f"# of large sliding windows: {n_iter}")
             # 4.1 Large sliding window: each sliding window goes through DiT as a short video, but only a few contribute to latent updates.
-            gt = torch.load("/home/conrevo/SkyReels-V2/activations.pt")
             for i in range(n_iter):
                 if i > 0:  # i !=0
                     prefix_video = decoded_curr_output[:, :, -overlap_history:].to(device)
@@ -205,12 +199,7 @@ class DiffusionForcingPipeline:
                     causal_block_size,
                 )
                 # 4.3 Prepare sample schedulers for each frame
-                sample_schedulers = []
                 sample_schedulers_counter = [0] * base_num_frames_iter
-                for _ in range(base_num_frames_iter):
-                    sample_scheduler = FlowUniPCMultistepScheduler()
-                    sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-                    sample_schedulers.append(sample_scheduler)
                 # 4.4 Denoise the short video in the sliding window
                 for j, timestep_i in enumerate(tqdm(step_matrix)):
                     update_mask_i = step_update_mask[j]
@@ -230,38 +219,15 @@ class DiffusionForcingPipeline:
                             * noise_factor
                         )
                         timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                    latent_model_input_gt = gt[f"{i}.{j}.latent_model_input"]
-                    latent_model_input_diff = latent_model_input.clone().cpu() - latent_model_input_gt
-                    if latent_model_input_diff.abs().max() > 0.1:
-                        print(f"{i}.{j} latent_model_input diff is too large: {latent_model_input_diff.abs().max()}")
-                    timestep_gt = gt[f"{i}.{j}.timestep"]
-                    timestep_diff = timestep.clone().cpu() - timestep_gt
-                    if timestep_diff.abs().max() > 0.1:
-                        print(f"{i}.{j} timestep diff is too large: {timestep_diff.abs().max()}")
-                    noise_pred_cond = dit.inner_model.diffusion_model(latent_model_input, timestep, gt["cond"])
-                    noise_pred_uncond = dit.inner_model.diffusion_model(latent_model_input, timestep, gt["uncond"])
-                    noise_pred_cond_gt = gt[f"{i}.{j}.noise_pred_cond"]
-                    noise_pred_uncond_gt = gt[f"{i}.{j}.noise_pred_uncond"]
-                    noise_pred_cond_diff = noise_pred_cond.clone().cpu() - noise_pred_cond_gt
-                    if noise_pred_cond_diff.abs().max() > 0.1:
-                        print(f"{i}.{j} noise_pred_cond diff is too large: {noise_pred_cond_diff.abs().max()}")
-                    noise_pred_uncond_diff = noise_pred_uncond.clone().cpu() - noise_pred_uncond_gt
-                    if noise_pred_uncond_diff.abs().max() > 0.1:
-                        print(f"{i}.{j} noise_pred_uncond diff is too large: {noise_pred_uncond_diff.abs().max()}")
-                    noise_pred = noise_pred_uncond + (noise_pred_cond - noise_pred_uncond) * dit.cfg
+                    noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
-                            latents[:, :, idx] = sample_schedulers[idx].step(
+                            latents[:, :, idx] = sample_scheduler.step(
                                 noise_pred[:, :, idx - valid_interval_start],
-                                timestep_i[idx],
+                                sample_schedulers_counter[idx],
                                 latents[:, :, idx],
-                                return_dict=False,
-                            )[0]
+                            )
                             sample_schedulers_counter[idx] += 1
-                    latents_gt = gt[f"{i}.{j}.latents"]
-                    latents_diff = latents.clone().cpu() - latents_gt
-                    if latents_diff.abs().max() > 0.1:
-                        print(f"{i}.{j} latents diff is too large: {latents_diff.abs().max()}")
                 latents = dit.inner_model.process_latent_out(latents.to(torch.float32))
                 vae_memory_used = vae.memory_used_decode(latents.shape, vae.vae_dtype)
                 model_management.load_models_gpu([vae.patcher], memory_required=vae_memory_used, force_full_load=vae.disable_offload)
