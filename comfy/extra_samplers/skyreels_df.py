@@ -1,6 +1,5 @@
 import math
 
-from typing import List
 from tqdm import tqdm
 
 import torch
@@ -8,8 +7,7 @@ import torch
 from comfy.samplers import CFGGuider, KSampler
 from comfy.model_sampling import ModelSamplingDiscreteFlow
 
-from .uni_pc_diffusers import FlowUniPCMultistepScheduler # TODO: reduce code duplicate
-from .flow_match_euler_step import FlowMatchEulerSampler, RecifitedFlowScheduler
+from .flow_match_euler_step import FlowMatchEulerSampler
 
 
 class DiffusionForcingPipeline:
@@ -50,7 +48,7 @@ class DiffusionForcingPipeline:
         # print(num_frames, step_template, base_num_frames, ar_step, num_pre_ready, casual_block_size, num_frames_block, base_num_frames_block)
         step_template = torch.cat(
             [
-                torch.tensor([999], dtype=torch.int64, device=step_template.device),
+                torch.tensor([step_template[0].item()], dtype=torch.int64, device=step_template.device),
                 step_template.long(),
                 torch.tensor([0], dtype=torch.int64, device=step_template.device),
             ]
@@ -107,7 +105,6 @@ class DiffusionForcingPipeline:
     def __call__(
         self,
         dit: CFGGuider,
-        num_inference_steps: int,
         latents_full: torch.Tensor,
         overlap_history: int = 17,
         addnoise_condition: int = 20,
@@ -117,24 +114,13 @@ class DiffusionForcingPipeline:
         sampler: KSampler = None,
     ):
         # 2. Basic parameters setup
-        device = dit.model_patcher.load_device
         b, c, f, h, w = latents_full.shape
         num_frames = (f - 1) * 4 + 1
         prefix_video = None
         predix_video_latent_length = 0
         model_sampling: ModelSamplingDiscreteFlow = dit.model_patcher.get_model_object("model_sampling")
-        shift = model_sampling.shift
-        if sampler.sampler == "uni_pc":
-            scheduler = FlowUniPCMultistepScheduler()
-            scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-            init_timesteps = scheduler.timesteps
-        elif sampler.sampler == "euler":
-            scheduler = RecifitedFlowScheduler(shift=5.0, sigma_min=0.001, sigma_max=0.999)
-            sigmas, init_timesteps = scheduler.schedule(num_inference_steps)
-            sigmas = sigmas.to(device)
-            init_timesteps = init_timesteps.to(device)
-        else:
-            raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
+        init_timesteps = model_sampling.timestep(sampler.sigmas)[:-1]
+        sample_scheduler = FlowMatchEulerSampler(sampler.sigmas)
 
         # 4. Short video generation. TODO: not yet modified properly
         if overlap_history is None or base_num_frames is None or num_frames <= base_num_frames:
@@ -143,17 +129,7 @@ class DiffusionForcingPipeline:
             step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                 f, init_timesteps, base_num_frames, ar_step, predix_video_latent_length, causal_block_size
             )
-            sample_schedulers = []
             sample_schedulers_counter = [0] * f
-            for _ in range(f):
-                if sampler.sampler == "uni_pc":
-                    sample_scheduler = FlowUniPCMultistepScheduler()
-                    sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-                elif sampler.sampler == "euler":
-                    sample_scheduler = FlowMatchEulerSampler(init_timesteps, sampler.sigmas)
-                else:
-                    raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
-                sample_schedulers.append(sample_scheduler)
             for j, timestep_i in enumerate(tqdm(step_matrix)):
                 update_mask_i = step_update_mask[j]
                 valid_interval_i = valid_interval[j]
@@ -172,9 +148,9 @@ class DiffusionForcingPipeline:
                 noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                 for idx in range(valid_interval_start, valid_interval_end):
                     if update_mask_i[idx].item():
-                        latents[:, :, idx] = sample_schedulers[idx].step(
+                        latents[:, :, idx] = sample_scheduler.step(
                             noise_pred[:, :, idx - valid_interval_start],
-                            timestep_i[idx] if sampler.sampler == "uni_pc" else sample_schedulers_counter[idx],
+                            sample_schedulers_counter[idx],
                             latents[:, :, idx],
                         )
                         sample_schedulers_counter[idx] += 1
@@ -212,17 +188,7 @@ class DiffusionForcingPipeline:
                     causal_block_size,
                 )
                 # 4.3 Prepare sample schedulers for each frame
-                sample_schedulers = []
                 sample_schedulers_counter = [0] * base_num_frames_iter
-                for _ in range(f):
-                    if sampler.sampler == "uni_pc":
-                        sample_scheduler = FlowUniPCMultistepScheduler()
-                        sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-                    elif sampler.sampler == "euler":
-                        sample_scheduler = FlowMatchEulerSampler(init_timesteps, sigmas)
-                    else:
-                        raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
-                    sample_schedulers.append(sample_scheduler)
                 # 4.4 Denoise the short video in the sliding window
                 for j, timestep_i in enumerate(tqdm(step_matrix)):
                     update_mask_i = step_update_mask[j]
@@ -245,9 +211,9 @@ class DiffusionForcingPipeline:
                     noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
-                            latents[:, :, idx] = sample_schedulers[idx].step(
+                            latents[:, :, idx] = sample_scheduler.step(
                                 noise_pred[:, :, idx - valid_interval_start],
-                                timestep_i[idx],
+                                sample_schedulers_counter[idx],
                                 latents[:, :, idx],
                             )
                             sample_schedulers_counter[idx] += 1

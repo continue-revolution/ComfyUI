@@ -17,7 +17,7 @@ class SkyReelsDFSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "The random seed used for creating the noise."}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 10000, "tooltip": "The number of steps used in the denoising process."}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01, "tooltip": "The Classifier-Free Guidance scale balances creativity and adherence to the prompt. Higher values result in images more closely matching the prompt however too high values will negatively impact quality."}),
-                "sampler_name": (["euler", "uni_pc"], {"default": "uni_pc", "tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."}),
+                "sampler_name": (["euler"], {"default": "uni_pc", "tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."}),
                 "scheduler": (KSampler.SCHEDULERS, {"default": "simple", "tooltip": "The scheduler controls how noise is gradually removed to form the image."}),
                 "positive": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to include in the image."}),
                 "negative": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to exclude from the image."}),
@@ -66,16 +66,10 @@ class SkyReelsDFSampler:
             cfg_guider.model_patcher.pre_run()
             original_calculte_denoised = cfg_guider.inner_model.model_sampling.calculate_denoised
             def identity_calculate_denoised(self, sigma, model_output, model_input):
-                if sampler_name == "uni_pc":
-                    return model_input - model_output * sigma[:, None, :, None, None]
-                elif sampler_name == "euler":
-                    return model_output
-                else:
-                    raise NotImplementedError(f"Sampler {sampler_name} not implemented")
+                return model_output
             cfg_guider.inner_model.model_sampling.calculate_denoised = MethodType(identity_calculate_denoised, cfg_guider.inner_model.model_sampling)
             samples = DiffusionForcingPipeline()(
                 dit=cfg_guider,
-                num_inference_steps=steps,
                 latents_full=noise,
                 overlap_history=overlap_history,
                 addnoise_condition=addnoise_condition,
