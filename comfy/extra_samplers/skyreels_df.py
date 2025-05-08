@@ -6,6 +6,7 @@ from tqdm import tqdm
 import torch
 
 from comfy.samplers import CFGGuider
+from comfy.sd import VAE
 
 from .uni_pc_diffusers import FlowUniPCMultistepScheduler # TODO: reduce code duplicate
 
@@ -105,8 +106,10 @@ class DiffusionForcingPipeline:
     def __call__(
         self,
         dit: CFGGuider,
+        vae: VAE,
+        shape: tuple,
+        seed: int,
         num_inference_steps: int,
-        latents_full: torch.Tensor,
         shift: float = 8.0,
         overlap_history: int = 17,
         addnoise_condition: int = 20,
@@ -116,7 +119,9 @@ class DiffusionForcingPipeline:
     ):
         # 2. Basic parameters setup
         device = dit.model_patcher.load_device
-        b, c, f, h, w = latents_full.shape
+        dtype = dit.model_patcher.model_dtype()
+        b, c, f, h, w = shape
+        generator = torch.Generator('cuda').manual_seed(seed)
         num_frames = (f - 1) * 4 + 1
         prefix_video = None
         predix_video_latent_length = 0
@@ -126,7 +131,7 @@ class DiffusionForcingPipeline:
 
         # 4. Short video generation. TODO: not yet modified properly
         if overlap_history is None or base_num_frames is None or num_frames <= base_num_frames:
-            latents = latents_full
+            latents = torch.randn((b, c, f, h, w), dtype=dtype, generator=generator, device=device)
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
             step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                 f, init_timesteps, base_num_frames, ar_step, predix_video_latent_length, causal_block_size
@@ -162,7 +167,7 @@ class DiffusionForcingPipeline:
                             return_dict=False,
                         )[0]
                         sample_schedulers_counter[idx] += 1
-            return [latents_full]
+            return [latents]
         # 4. Long video generation (sliding window)
         else:
             base_num_frames = (base_num_frames - 1) // 4 + 1 if base_num_frames is not None else f
@@ -170,10 +175,12 @@ class DiffusionForcingPipeline:
             n_iter = 1 + (f - base_num_frames - 1) // (base_num_frames - overlap_history_frames) + 1
             print(f"# of large sliding windows: {n_iter}")
             # 4.1 Large sliding window: each sliding window goes through DiT as a short video, but only a few contribute to latent updates.
-            latents_base = []
+            gt = torch.load("/home/conrevo/SkyReels-V2/activations.pt")
             for i in range(n_iter):
                 if i > 0:  # i !=0
-                    prefix_video = latents[:, :, -overlap_history_frames:]
+                    prefix_video = decoded_curr_output[:, :, -overlap_history:].to(device)
+                    prefix_video = dit.inner_model.process_latent_in(prefix_video)
+                    prefix_video = vae.first_stage_model.encode(prefix_video)
                     if prefix_video.shape[2] % causal_block_size != 0:
                         truncate_len = prefix_video.shape[2] % causal_block_size
                         print("the length of prefix video is truncated for the casual block size alignment.")
@@ -182,10 +189,11 @@ class DiffusionForcingPipeline:
                     finished_frame_num = i * (base_num_frames - overlap_history_frames) + overlap_history_frames
                     left_frame_num = f - finished_frame_num
                     base_num_frames_iter = min(left_frame_num + overlap_history_frames, base_num_frames)
-                    latents = latents_full[:, :, finished_frame_num - predix_video_latent_length : finished_frame_num - predix_video_latent_length + base_num_frames_iter, :, :]
                 else:  # i == 0
                     base_num_frames_iter = base_num_frames
-                    latents = latents_full[:, :, :base_num_frames_iter, :, :]
+                latents = torch.randn((b, c, base_num_frames_iter, h, w), dtype=dtype, generator=generator, device=device)
+                if prefix_video is not None:
+                    latents[:, :, :predix_video_latent_length] = prefix_video.to(dtype)
                 # 4.2 Decide the step of each frame in the sliding window
                 step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                     base_num_frames_iter,
@@ -221,7 +229,25 @@ class DiffusionForcingPipeline:
                             * noise_factor
                         )
                         timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                    noise_pred = dit(latent_model_input, timestep * 0.001)
+                    latent_model_input_gt = gt[f"{i}.{j}.latent_model_input"]
+                    latent_model_input_diff = latent_model_input.clone().cpu() - latent_model_input_gt
+                    if latent_model_input_diff.abs().max() > 0.1:
+                        print(f"{i}.{j} latent_model_input diff is too large: {latent_model_input_diff.abs().max()}")
+                    timestep_gt = gt[f"{i}.{j}.timestep"]
+                    timestep_diff = timestep.clone().cpu() - timestep_gt
+                    if timestep_diff.abs().max() > 0.1:
+                        print(f"{i}.{j} timestep diff is too large: {timestep_diff.abs().max()}")
+                    noise_pred_cond = dit.inner_model.diffusion_model(latent_model_input, timestep, gt["cond"])
+                    noise_pred_uncond = dit.inner_model.diffusion_model(latent_model_input, timestep, gt["uncond"])
+                    noise_pred_cond_gt = gt[f"{i}.{j}.noise_pred_cond"]
+                    noise_pred_uncond_gt = gt[f"{i}.{j}.noise_pred_uncond"]
+                    noise_pred_cond_diff = noise_pred_cond.clone().cpu() - noise_pred_cond_gt
+                    if noise_pred_cond_diff.abs().max() > 0.1:
+                        print(f"{i}.{j} noise_pred_cond diff is too large: {noise_pred_cond_diff.abs().max()}")
+                    noise_pred_uncond_diff = noise_pred_uncond.clone().cpu() - noise_pred_uncond_gt
+                    if noise_pred_uncond_diff.abs().max() > 0.1:
+                        print(f"{i}.{j} noise_pred_uncond diff is too large: {noise_pred_uncond_diff.abs().max()}")
+                    noise_pred = noise_pred_uncond + (noise_pred_cond - noise_pred_uncond) * dit.cfg
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
                             latents[:, :, idx] = sample_schedulers[idx].step(
@@ -231,5 +257,16 @@ class DiffusionForcingPipeline:
                                 return_dict=False,
                             )[0]
                             sample_schedulers_counter[idx] += 1
-                latents_base.append(latents.clone())
-            return latents_base
+                    latents_gt = gt[f"{i}.{j}.latents"]
+                    latents_diff = latents.clone().cpu() - latents_gt
+                    if latents_diff.abs().max() > 0.1:
+                        print(f"{i}.{j} latents diff is too large: {latents_diff.abs().max()}")
+                latents = dit.inner_model.process_latent_out(latents.to(torch.float32))
+                decoded_curr_output = vae.first_stage_model.decode(latents).float().clamp(-1, 1).cpu()
+                if i > 0:
+                    decoded_output = torch.cat([decoded_output, decoded_curr_output[:, :, overlap_history:]], dim=2)
+                else:
+                    decoded_output = decoded_curr_output
+            pixel_samples = vae.process_output(decoded_output).to(vae.output_device)
+            pixel_samples = pixel_samples.reshape(-1, *pixel_samples.shape[-3:])
+            return pixel_samples
