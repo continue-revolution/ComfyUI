@@ -908,7 +908,7 @@ class UNETLoader:
             model_options["fp8_optimizations"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
-
+        model_options["dtype"] = torch.bfloat16
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
         return (model,)
@@ -2259,6 +2259,7 @@ def init_builtin_extra_nodes():
         "nodes_hidream.py",
         "nodes_fresca.py",
         "nodes_preview_any.py",
+        "nodes_skyreels.py"
     ]
 
     api_nodes_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy_api_nodes")

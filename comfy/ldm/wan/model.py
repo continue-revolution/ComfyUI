@@ -202,7 +202,11 @@ class WanAttentionBlock(nn.Module):
         """
         # assert e.dtype == torch.float32
 
-        e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device) + e).chunk(6, dim=1)
+        if e.dim() == 3: # for normal wan models
+            e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device) + e).chunk(6, dim=1)
+        elif e.dim() == 4: # for skyreel
+            e = (comfy.model_management.cast_to(self.modulation.unsqueeze(2), dtype=x.dtype, device=x.device) + e).chunk(6, dim=1)
+            e = [ei.squeeze(1) for ei in e]
         # assert e[0].dtype == torch.float32
 
         # self-attention
@@ -270,8 +274,11 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        # assert e.dtype == torch.float32
-        e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device) + e.unsqueeze(1)).chunk(2, dim=1)
+        if e.dim() == 2:  # for normal wan models
+            e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device) + e.unsqueeze(1)).chunk(2, dim=1)
+        elif e.dim() == 3:  # for skyreel
+            e = (comfy.model_management.cast_to(self.modulation.unsqueeze(2), dtype=x.dtype, device=x.device) + e.unsqueeze(1)).chunk(2, dim=1)
+            e = [ei.squeeze(1) for ei in e]
         x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
@@ -321,6 +328,7 @@ class WanModel(torch.nn.Module):
                  cross_attn_norm=True,
                  eps=1e-6,
                  flf_pos_embed_token_number=None,
+                 is_skyreel_df=False,
                  image_model=None,
                  device=None,
                  dtype=None,
@@ -395,6 +403,11 @@ class WanModel(torch.nn.Module):
             operations.Linear(freq_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.SiLU(), operations.Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
         self.time_projection = nn.Sequential(nn.SiLU(), operations.Linear(dim, dim * 6, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
 
+        self.is_skyreel_df = is_skyreel_df
+        if is_skyreel_df:
+            self.fps_embedding = nn.Embedding(2, dim)
+            self.fps_projection = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim * 6))
+
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
@@ -413,6 +426,34 @@ class WanModel(torch.nn.Module):
             self.img_emb = MLPProj(1280, dim, flf_pos_embed_token_number=flf_pos_embed_token_number, operation_settings=operation_settings)
         else:
             self.img_emb = None
+
+    def skyreel_fps_embed(self, t, e, e0, grid_sizes, device):
+        # with torch.amp.autocast("cuda", dtype=torch.float32):
+            if t.dim() == 2:
+                b, f = t.shape
+                _flag_df = True
+            else:
+                _flag_df = False
+
+            # they fixed the fps. I guess they trained their model with this buggy code.
+            fps = torch.tensor([1], dtype=torch.long, device=device)
+
+            fps_emb = self.fps_embedding(fps).float()
+            if _flag_df:
+                e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim)).repeat(b * f, 1, 1)
+            else:
+                e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim))
+
+            if _flag_df:
+                e = e.view(b, f, 1, 1, self.dim)
+                e0 = e0.view(b, f, 1, 1, 6, self.dim)
+                e = e.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1).flatten(1, 3)
+                e0 = e0.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1, 1).flatten(1, 3)
+                e0 = e0.transpose(1, 2).contiguous()
+
+            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            return e, e0.to(dtype=e.dtype)
+
 
     def forward_orig(
         self,
@@ -452,8 +493,11 @@ class WanModel(torch.nn.Module):
 
         # time embeddings
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+        if self.is_skyreel_df:
+            e, e0 = self.skyreel_fps_embed(t, e, e0, grid_sizes, x.device)
 
         # context
         context = self.text_embedding(context)
