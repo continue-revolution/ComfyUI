@@ -5,9 +5,11 @@ from tqdm import tqdm
 
 import torch
 
-from comfy.samplers import CFGGuider
+from comfy.samplers import CFGGuider, KSampler
+from comfy.model_sampling import ModelSamplingDiscreteFlow
 
 from .uni_pc_diffusers import FlowUniPCMultistepScheduler # TODO: reduce code duplicate
+from .flow_match_euler_step import FlowMatchEulerSampler, RecifitedFlowScheduler
 
 
 class DiffusionForcingPipeline:
@@ -107,12 +109,12 @@ class DiffusionForcingPipeline:
         dit: CFGGuider,
         num_inference_steps: int,
         latents_full: torch.Tensor,
-        shift: float = 8.0,
         overlap_history: int = 17,
         addnoise_condition: int = 20,
         base_num_frames: int = 97,
         ar_step: int = 5,
         causal_block_size: int = 5,
+        sampler: KSampler = None,
     ):
         # 2. Basic parameters setup
         device = dit.model_patcher.load_device
@@ -120,9 +122,19 @@ class DiffusionForcingPipeline:
         num_frames = (f - 1) * 4 + 1
         prefix_video = None
         predix_video_latent_length = 0
-        scheduler = FlowUniPCMultistepScheduler()
-        scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-        init_timesteps = scheduler.timesteps
+        model_sampling: ModelSamplingDiscreteFlow = dit.model_patcher.get_model_object("model_sampling")
+        shift = model_sampling.shift
+        if sampler.sampler == "uni_pc":
+            scheduler = FlowUniPCMultistepScheduler()
+            scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+            init_timesteps = scheduler.timesteps
+        elif sampler.sampler == "euler":
+            scheduler = RecifitedFlowScheduler(shift=5.0, sigma_min=0.001, sigma_max=0.999)
+            sigmas, init_timesteps = scheduler.schedule(num_inference_steps)
+            sigmas = sigmas.to(device)
+            init_timesteps = init_timesteps.to(device)
+        else:
+            raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
 
         # 4. Short video generation. TODO: not yet modified properly
         if overlap_history is None or base_num_frames is None or num_frames <= base_num_frames:
@@ -131,15 +143,20 @@ class DiffusionForcingPipeline:
             step_matrix, _, step_update_mask, valid_interval = self.generate_timestep_matrix(
                 f, init_timesteps, base_num_frames, ar_step, predix_video_latent_length, causal_block_size
             )
-            sample_schedulers: List[FlowUniPCMultistepScheduler] = []
+            sample_schedulers = []
             sample_schedulers_counter = [0] * f
             for _ in range(f):
-                sample_scheduler = FlowUniPCMultistepScheduler()
-                sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+                if sampler.sampler == "uni_pc":
+                    sample_scheduler = FlowUniPCMultistepScheduler()
+                    sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+                elif sampler.sampler == "euler":
+                    sample_scheduler = FlowMatchEulerSampler(init_timesteps, sampler.sigmas)
+                else:
+                    raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
                 sample_schedulers.append(sample_scheduler)
-            for i, timestep_i in enumerate(tqdm(step_matrix)):
-                update_mask_i = step_update_mask[i]
-                valid_interval_i = valid_interval[i]
+            for j, timestep_i in enumerate(tqdm(step_matrix)):
+                update_mask_i = step_update_mask[j]
+                valid_interval_i = valid_interval[j]
                 valid_interval_start, valid_interval_end = valid_interval_i
                 timestep = timestep_i[None, valid_interval_start:valid_interval_end].clone()
                 latent_model_input = latents[:, :, valid_interval_start:valid_interval_end, :, :].clone()
@@ -152,15 +169,14 @@ class DiffusionForcingPipeline:
                         * noise_factor
                     )
                     timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                noise_pred = dit(latent_model_input, timestep * 0.001)
+                noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                 for idx in range(valid_interval_start, valid_interval_end):
                     if update_mask_i[idx].item():
                         latents[:, :, idx] = sample_schedulers[idx].step(
                             noise_pred[:, :, idx - valid_interval_start],
-                            timestep_i[idx],
+                            timestep_i[idx] if sampler.sampler == "uni_pc" else sample_schedulers_counter[idx],
                             latents[:, :, idx],
-                            return_dict=False,
-                        )[0]
+                        )
                         sample_schedulers_counter[idx] += 1
             return [latents_full]
         # 4. Long video generation (sliding window)
@@ -198,9 +214,14 @@ class DiffusionForcingPipeline:
                 # 4.3 Prepare sample schedulers for each frame
                 sample_schedulers = []
                 sample_schedulers_counter = [0] * base_num_frames_iter
-                for _ in range(base_num_frames_iter):
-                    sample_scheduler = FlowUniPCMultistepScheduler()
-                    sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+                for _ in range(f):
+                    if sampler.sampler == "uni_pc":
+                        sample_scheduler = FlowUniPCMultistepScheduler()
+                        sample_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+                    elif sampler.sampler == "euler":
+                        sample_scheduler = FlowMatchEulerSampler(init_timesteps, sigmas)
+                    else:
+                        raise NotImplementedError(f"Sampler {sampler.sampler} is not implemented.")
                     sample_schedulers.append(sample_scheduler)
                 # 4.4 Denoise the short video in the sliding window
                 for j, timestep_i in enumerate(tqdm(step_matrix)):
@@ -221,15 +242,14 @@ class DiffusionForcingPipeline:
                             * noise_factor
                         )
                         timestep[:, valid_interval_start:predix_video_latent_length] = timestep_for_noised_condition
-                    noise_pred = dit(latent_model_input, timestep * 0.001)
+                    noise_pred = dit(latent_model_input, timestep / model_sampling.multiplier)
                     for idx in range(valid_interval_start, valid_interval_end):
                         if update_mask_i[idx].item():
                             latents[:, :, idx] = sample_schedulers[idx].step(
                                 noise_pred[:, :, idx - valid_interval_start],
                                 timestep_i[idx],
                                 latents[:, :, idx],
-                                return_dict=False,
-                            )[0]
+                            )
                             sample_schedulers_counter[idx] += 1
                 latents_base.append(latents.clone())
             return latents_base

@@ -258,76 +258,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
     def time_shift(self, mu: float, sigma: float, t: torch.Tensor):
         return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
-    def convert_model_output(
-        self,
-        model_output: torch.Tensor,
-        *args,
-        sample: torch.Tensor = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        r"""
-        Convert the model output to the corresponding type the UniPC algorithm needs.
-
-        Args:
-            model_output (`torch.Tensor`):
-                The direct output from the learned diffusion model.
-            timestep (`int`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
-
-        Returns:
-            `torch.Tensor`:
-                The converted model output.
-        """
-        timestep = args[0] if len(args) > 0 else kwargs.pop("timestep", None)
-        if sample is None:
-            if len(args) > 1:
-                sample = args[1]
-            else:
-                raise ValueError("missing `sample` as a required keyward argument")
-        if timestep is not None:
-            deprecate(
-                "timesteps",
-                "1.0.0",
-                "Passing `timesteps` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
-            )
-
-        sigma = self.sigmas[self.step_index]
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
-
-        if self.predict_x0:
-            if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
-                x0_pred = sample - sigma_t * model_output
-            else:
-                raise ValueError(
-                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
-                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
-                )
-
-            if self.config.thresholding:
-                x0_pred = self._threshold_sample(x0_pred)
-
-            return x0_pred
-        else:
-            if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
-                epsilon = sample - (1 - sigma_t) * model_output
-            else:
-                raise ValueError(
-                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
-                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
-                )
-
-            if self.config.thresholding:
-                sigma_t = self.sigmas[self.step_index]
-                x0_pred = sample - sigma_t * model_output
-                x0_pred = self._threshold_sample(x0_pred)
-                epsilon = model_output + x0_pred
-
-            return epsilon
-
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -626,7 +556,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         model_output: torch.Tensor,
         timestep: Union[int, torch.Tensor],
         sample: torch.Tensor,
-        return_dict: bool = True,
     ) -> Union[SchedulerOutput, Tuple]:
         """
         Predict the sample from the previous timestep by reversing the SDE. This function propagates the sample with
@@ -662,10 +591,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             and self.last_sample is not None  # pyright: ignore
         )
 
-        model_output_convert = self.convert_model_output(model_output, sample=sample)
         if use_corrector:
             sample = self.multistep_uni_c_bh_update(
-                this_model_output=model_output_convert,
+                this_model_output=model_output,
                 last_sample=self.last_sample,
                 this_sample=sample,
                 order=self.this_order,
@@ -675,13 +603,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             self.model_outputs[i] = self.model_outputs[i + 1]
             self.timestep_list[i] = self.timestep_list[i + 1]
 
-        self.model_outputs[-1] = model_output_convert
+        self.model_outputs[-1] = model_output
         self.timestep_list[-1] = timestep  # pyright: ignore
 
-        if self.config.lower_order_final:
-            this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)  # pyright: ignore
-        else:
-            this_order = self.config.solver_order
+        this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)  # pyright: ignore
 
         self.this_order = min(this_order, self.lower_order_nums + 1)  # warmup for multistep
         assert self.this_order > 0
@@ -699,10 +624,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         # upon completion increase step index by one
         self._step_index += 1  # pyright: ignore
 
-        if not return_dict:
-            return (prev_sample,)
-
-        return SchedulerOutput(prev_sample=prev_sample)
+        return prev_sample
 
     def scale_model_input(self, sample: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """
