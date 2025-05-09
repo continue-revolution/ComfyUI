@@ -429,31 +429,30 @@ class WanModel(torch.nn.Module):
             self.img_emb = None
 
     def skyreel_fps_embed(self, t, e, e0, grid_sizes, device):
-        # with torch.amp.autocast("cuda", dtype=torch.float32):
-            if t.dim() == 2:
-                b, f = t.shape
-                _flag_df = True
-            else:
-                _flag_df = False
+        if t.dim() == 2:
+            b, f = t.shape
+            _flag_df = True
+        else:
+            _flag_df = False
 
+        if self.is_skyreel_df:
             # they fixed the fps. I guess they trained their model with this buggy code.
             fps = torch.tensor([1], dtype=torch.long, device=device)
-
             fps_emb = self.fps_embedding(fps).float()
             if _flag_df:
                 e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim)).repeat(b * f, 1, 1)
             else:
                 e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim))
 
-            if _flag_df:
-                e = e.view(b, f, 1, 1, self.dim)
-                e0 = e0.view(b, f, 1, 1, 6, self.dim)
-                e = e.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1).flatten(1, 3)
-                e0 = e0.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1, 1).flatten(1, 3)
-                e0 = e0.transpose(1, 2).contiguous()
+        if _flag_df:
+            e = e.view(b, f, 1, 1, self.dim)
+            e0 = e0.view(b, f, 1, 1, 6, self.dim)
+            e = e.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1).flatten(1, 3)
+            e0 = e0.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1, 1).flatten(1, 3)
+            e0 = e0.transpose(1, 2).contiguous()
 
-            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
-            return e, e0.to(dtype=e.dtype)
+        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        return e, e0.to(dtype=e.dtype)
 
 
     def forward_orig(
@@ -497,8 +496,7 @@ class WanModel(torch.nn.Module):
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
-        if self.is_skyreel_df:
-            e, e0 = self.skyreel_fps_embed(t, e, e0, grid_sizes, x.device)
+        e, e0 = self.skyreel_fps_embed(t, e, e0, grid_sizes, x.device)
 
         # context
         context = self.text_embedding(context)
